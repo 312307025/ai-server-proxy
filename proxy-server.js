@@ -1,0 +1,763 @@
+/**
+ * AI API 限流代理服务器
+ * 
+ * 作用：在本地启动一个代理，接管 TraeCode 发来的 AI API 请求，
+ *       自动处理额度限流（429 错误），排队等待后重试。
+ * 
+ * 使用方式：
+ *   1. 终端运行：node proxy-server.js
+ *   2. 在 TraeCode 设置 > 模型 > 添加自定义模型中，
+ *      配置 API 地址为 http://localhost:13000
+ * 
+ * 依赖：Node.js 内置，无需安装任何 npm 包
+ */
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
+
+// ===================== 配置区域 =====================
+const CONFIG = {
+  // 本地代理监听端口
+  PROXY_PORT: 13000,
+
+  // 目标 API 地址（你的实际 AI 接口地址）
+  TARGET_URL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+
+  // 遇到 429 限流时，等待多少秒后重试
+  RETRY_AFTER_SECONDS: 60,
+
+  // 最大重试次数（防止死循环）
+  MAX_RETRY: 10,
+
+  // 日志配置
+  LOG_DIR: 'logs',                // 日志存放目录（相对本文件），留空则不写文件
+  LOG_KEEP_DAYS: 0,               // 保留天数，0 或负数表示永久保留、不自动清理
+
+  // 服务存活心跳日志间隔（秒）
+  // 作用：日志中若连续多个心跳周期缺失，说明进程已经退出，
+  //       用于区分「服务挂了」与「确实没有请求流量」
+  HEARTBEAT_LOG_SECONDS: 300,
+};
+// ====================================================
+
+// ---- 日志工具（按日分文件，自动清理过期日志） ----
+const LOG_DIR = CONFIG.LOG_DIR ? path.resolve(__dirname, CONFIG.LOG_DIR) : null;
+const LOG_KEEP_MS = CONFIG.LOG_KEEP_DAYS * 24 * 60 * 60 * 1000;
+let logStream = null;
+let currentLogDate = '';
+
+/** 获取当天日志文件的完整路径 */
+function getLogFilePath() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return path.join(LOG_DIR, `proxy-server-${dateStr}.log`);
+}
+
+/** 确保日志文件流指向当天文件 */
+function ensureLogStream() {
+  if (!LOG_DIR) return;
+  const today = new Date().toISOString().slice(0, 10); // '2026-09-30'
+  if (currentLogDate !== today) {
+    if (logStream) logStream.end();
+    currentLogDate = today;
+    // 日志目录可能还不存在（首次运行或刚改过配置），先确保创建
+    if (!fs.existsSync(LOG_DIR)) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+    }
+    logStream = fs.createWriteStream(getLogFilePath(), { flags: 'a', encoding: 'utf-8' });
+  }
+}
+
+/** 启动时清理超过保留天数的旧日志（LOG_KEEP_DAYS <= 0 时永久保留） */
+function cleanOldLogs() {
+  if (!LOG_DIR) return;
+  // 0 或负数表示永久保留，不执行清理
+  if (CONFIG.LOG_KEEP_DAYS <= 0) return;
+  const now = Date.now();
+  try {
+    const files = fs.readdirSync(LOG_DIR);
+    files.forEach(file => {
+      if (file.startsWith('proxy-server-') && file.endsWith('.log')) {
+        const filePath = path.join(LOG_DIR, file);
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > LOG_KEEP_MS) {
+          fs.unlinkSync(filePath);
+          console.log(`[日志] 清理过期日志: ${file}`);
+        }
+      }
+    });
+  } catch (e) {
+    console.error('[日志] 清理过期日志失败:', e.message);
+  }
+}
+
+/**
+ * 格式化时间戳：YYYY-MM-DD HH:MM:SS
+ */
+function formatTimestamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/**
+ * 统一日志输出：同时写入控制台和日志文件
+ * @param {'INFO'|'WARN'|'ERROR'} level - 日志等级
+ * @param {string} message - 日志内容
+ */
+function log(level, message) {
+  ensureLogStream();
+
+  const ts = formatTimestamp();
+  const line = `[${ts}] [${level}] ${message}`;
+
+  // 控制台输出
+  if (level === 'ERROR') {
+    console.error(line);
+  } else if (level === 'WARN') {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+
+  // 写入日志文件
+  if (logStream) {
+    logStream.write(line + '\n');
+  }
+}
+// ====================================================
+
+// ---- 兜底：捕获未捕获异常，记录日志后继续运行 ----
+process.on('uncaughtException', (err, origin) => {
+  const ts = formatTimestamp();
+  const line = `[${ts}] [FATAL] 💥 未捕获异常: ${err.message} | origin: ${origin} | stack: ${err.stack}`;
+  console.error(line);
+  // 尝试写入日志文件
+  if (logStream) {
+    logStream.write(line + '\n');
+  } else {
+    // 兜底：直接追加到今天的日志文件
+    try {
+      const logFile = getLogFilePath();
+      fs.appendFileSync(logFile, line + '\n', 'utf-8');
+    } catch (e) {
+      console.error('[日志] 无法写入致命错误:', e.message);
+    }
+  }
+});
+// ====================================================
+
+// ---- 请求队列 ----
+const requestQueue = [];
+let isProcessing = false;
+let requestCounter = 0; // 自增请求ID，方便关联同一次请求的所有日志
+
+/** 从请求体中提取模型名（可能没有） */
+function extractModel(body) {
+  if (!body) return '';
+  try {
+    const parsed = JSON.parse(body);
+    return parsed.model || '';
+  } catch {
+    return '';
+  }
+}
+
+/** 人类可读的字节大小 */
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** 提取请求中的消息统计 */
+function extractMessageStats(body) {
+  if (!body) return { count: 0, chars: 0 };
+  try {
+    const parsed = JSON.parse(body);
+    const messages = parsed.messages || [];
+    let totalChars = 0;
+    messages.forEach(msg => {
+      if (typeof msg.content === 'string') {
+        totalChars += msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        msg.content.forEach(c => {
+          if (c.text) totalChars += c.text.length;
+        });
+      }
+    });
+    return { count: messages.length, chars: totalChars };
+  } catch {
+    return { count: 0, chars: 0 };
+  }
+}
+
+/** 提取上游响应中与限流相关的头信息 */
+function extractRateLimitInfo(headers) {
+  const parts = [];
+  if (headers['x-ratelimit-limit']) parts.push(`limit=${headers['x-ratelimit-limit']}`);
+  if (headers['x-ratelimit-remaining']) parts.push(`remaining=${headers['x-ratelimit-remaining']}`);
+  if (headers['x-ratelimit-reset']) parts.push(`reset=${headers['x-ratelimit-reset']}`);
+  if (headers['x-request-id']) parts.push(`reqId=${headers['x-request-id']}`);
+  return parts.length ? parts.join(' ') : '';
+}
+
+/**
+ * 读取上游响应体全部内容，并根据 content-encoding 自动解压
+ * 上游（如 DashScope）返回错误响应时也可能使用 gzip 压缩，
+ * 若不先解压直接 toString 会得到乱码，导致无法定位真实错误信息。
+ * @param {object} proxyRes - 上游响应对象
+ * @returns {Promise<string>} 解压后的响应体文本
+ */
+function readResponseBody(proxyRes) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    proxyRes.on('data', c => chunks.push(c));
+    proxyRes.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+      try {
+        if (encoding === 'gzip') return resolve(zlib.gunzipSync(buf).toString('utf-8'));
+        if (encoding === 'deflate') return resolve(zlib.inflateSync(buf).toString('utf-8'));
+        if (encoding === 'br') return resolve(zlib.brotliDecompressSync(buf).toString('utf-8'));
+      } catch (e) {
+        // 解压失败则回退为原始内容，避免影响主流程
+      }
+      resolve(buf.toString('utf-8'));
+    });
+    proxyRes.on('error', () => resolve(''));
+  });
+}
+
+/**
+ * 确保已向客户端写出 SSE 响应头，并在重试期间发送注释心跳保活
+ * 目的：限流/网络错误重试时耗时可能长达数分钟，提前建好 SSE 连接并持续
+ *       发送心跳，避免客户端（TraeCode）因长时间无数据而超时断开。
+ * 注意：心跳只使用 SSE 注释行（":" 开头），客户端会忽略，绝不产生 content，
+ *       因此不会污染 AI 回复内容，也不会干扰 tool_calls 轮次的解析。
+ * @param {object} item - 请求项
+ * @returns {boolean} 客户端连接是否仍然可用
+ */
+function ensureSseKeepAlive(item) {
+  const { reqId, res, isStream } = item;
+
+  // 客户端已断开，无需保活
+  if (res.destroyed || res.writableEnded) return false;
+
+  // 非流式请求无法提前返回响应头，只能原样等待
+  if (!isStream) return true;
+
+  if (!item.responseStarted) {
+    log('INFO', `[#${reqId}] 📡 提前返回 SSE 响应头（重试中，保持连接）`);
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write(': proxy keep-alive\n\n'); // SSE 注释行心跳，客户端会忽略
+    item.responseStarted = true;
+  } else {
+    // 已建过连接，补一条心跳续命
+    res.write(': proxy keep-alive\n\n');
+  }
+  return true;
+}
+
+/**
+ * 向客户端返回错误响应，自动适配「已提前建立 SSE 连接」的场景
+ * @param {object} item - 请求项
+ * @param {number} statusCode - HTTP 状态码（未建 SSE 连接时使用）
+ * @param {object} payload - 标准错误体，形如 { error: { message, type } }
+ */
+function respondError(item, statusCode, payload) {
+  const { res } = item;
+
+  if (item.responseStarted) {
+    // 已经写出 SSE 响应头，只能通过 SSE 事件告知错误，不能再 writeHead
+    if (!res.destroyed && !res.writableEnded) {
+      try {
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            delta: { role: 'assistant', content: `❌ ${payload.error.message}` },
+            index: 0,
+            finish_reason: 'stop',
+          }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch (e) {
+        // 连接可能已断开，忽略写入异常
+      }
+    }
+    return;
+  }
+
+  if (!res.destroyed && !res.headersSent) {
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  if (!res.destroyed) res.end();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 带 SSE 注释心跳的等待（限流重试期间保活，防止客户端长时间无数据而超时）
+ * 心跳统一使用 SSE 注释行（以 ":" 开头），客户端会忽略，绝不产生 content，
+ * 因此不会污染 AI 回复内容，也不会干扰 tool_calls 轮次的解析。
+ * @param {number} ms - 等待总时长（毫秒）
+ * @param {object} item - 请求项，需包含 res 与 responseStarted 字段
+ */
+async function sleepWithHeartbeat(ms, item) {
+  const HEARTBEAT_INTERVAL = 10000; // 每 10 秒发送一次心跳
+  let remaining = ms;
+  while (remaining > 0) {
+    const chunk = Math.min(HEARTBEAT_INTERVAL, remaining);
+    await sleep(chunk);
+    remaining -= chunk;
+
+    // 客户端已断开则提前结束等待
+    if (item.res.destroyed || item.res.writableEnded) return;
+
+    // 仅在已建立 SSE 连接时发送注释心跳
+    if (item.responseStarted) {
+      item.res.write(': proxy keep-alive\n\n');
+    }
+  }
+}
+
+/**
+ * 发起 HTTP/HTTPS 请求（支持流式和非流式）
+ */
+function forwardRequest(targetUrl, method, headers, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(targetUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+
+    // 构建转发请求头，去掉 host 和 connection 相关
+    const forwardHeaders = { ...headers };
+    delete forwardHeaders['host'];
+    delete forwardHeaders['connection'];
+    delete forwardHeaders['content-length'];
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: method,
+      headers: forwardHeaders,
+      timeout: 300000, // 5 分钟超时
+    };
+
+    const proxyReq = mod.request(options, (proxyRes) => {
+      resolve(proxyRes);
+    });
+
+    proxyReq.on('error', (err) => {
+      reject(err);
+    });
+
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy();
+      reject(new Error('Request timeout'));
+    });
+
+    if (body) {
+      proxyReq.write(body);
+    }
+    proxyReq.end();
+  });
+}
+
+/**
+ * 处理单个请求（含重试逻辑）
+ * 每次重试先等待 RETRY_AFTER_SECONDS 秒
+ */
+async function processRequest(item) {
+  const { reqId, req, res, body, model, isStream, enqueuedAt, retryCount } = item;
+  const startTime = Date.now();
+
+  // 记录队列等待时间：仅取「入队 → 出队」这段真实排队时长，
+  // 重试时不重复计算（否则会把上一次请求的处理耗时误当排队时间）
+  const waitTime = (retryCount === 0 && enqueuedAt && item.dequeuedAt)
+    ? item.dequeuedAt - enqueuedAt
+    : 0;
+
+  // 如果已经在重试中，先等待
+  if (retryCount > 0) {
+    // 客户端（TraeCode）已断开则直接终止，避免为空连接继续重试
+    if (res.destroyed || res.writableEnded) {
+      log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+      return;
+    }
+    log('WARN', `[#${reqId}] ⏳ 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount}次)`);
+    // 带注释心跳的等待，避免客户端长时间无数据而超时
+    await sleepWithHeartbeat(CONFIG.RETRY_AFTER_SECONDS * 1000, item);
+  }
+
+  // TARGET_URL 已包含 /v1 路径（如 dashscope.aliyuncs.com/compatible-mode/v1）
+  // req.url 也以 /v1/... 开头，去掉 /v1 前缀避免路径重复
+  const apiPath = req.url.replace(/^\/v1(\/|$)/, '/');
+  const targetUrl = CONFIG.TARGET_URL.replace(/\/+$/, '') + apiPath;
+  // TraeCode 配置自定义模型时会自带 Authorization，直接透传
+  const headers = req.headers;
+
+  try {
+    // 日志：队列等待 + 开始转发
+    if (waitTime > 0) {
+      log('INFO', `[#${reqId}] 📋 队列等待: ${waitTime}ms`);
+    }
+    log('INFO', `[#${reqId}] ➡️ 转发 → ${targetUrl}`);
+
+    // 转发请求
+    const proxyRes = await forwardRequest(targetUrl, req.method, headers, body);
+    const upstreamTime = Date.now() - startTime;
+
+    // === 提取上游响应信息 ===
+    const rateLimitInfo = extractRateLimitInfo(proxyRes.headers);
+    const statusCode = proxyRes.statusCode;
+
+    // 检查是否 429（额度限流）
+    if (statusCode === 429) {
+      // 读取上游错误体
+      const errBody = await readResponseBody(proxyRes);
+      log('WARN', `[#${reqId}] 🔄 限流429` +
+        (rateLimitInfo ? ` | ${rateLimitInfo}` : '') +
+        ` | 上游响应: ${errBody.substring(0, 500)}`);
+
+      // 如果是流式请求，提前返回 SSE 响应头并持续心跳，保持连接不断
+      // （避免 TraeCode 在长时间重试等待中主动超时断开）
+      ensureSseKeepAlive(item);
+
+      // 检查重试次数
+      if (retryCount + 1 > CONFIG.MAX_RETRY) {
+        log('ERROR', `[#${reqId}] ❌ 超过最大重试次数(${CONFIG.MAX_RETRY})，放弃`);
+        respondError(item, 429, {
+          error: { message: '超过最大重试次数，上游 API 持续限流', type: 'proxy_rate_limit' }
+        });
+        return;
+      }
+
+      // 客户端已断开则停止重试，避免无意义的"幽灵请求"（白白消耗上游额度）
+      if (res.destroyed || res.writableEnded) {
+        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        return;
+      }
+
+      log('WARN', `[#${reqId}] 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      item.retryCount = retryCount + 1;
+      await processRequest(item);
+      return;
+    }
+
+    // 检查是否其他服务端错误（5xx），也适当重试
+    if (statusCode >= 500 && statusCode < 600) {
+      // 读取上游错误体
+      const errBody = await readResponseBody(proxyRes);
+      log('WARN', `[#${reqId}] 🔄 服务端错误 ${statusCode}` +
+        (rateLimitInfo ? ` | ${rateLimitInfo}` : '') +
+        ` | 上游响应: ${errBody.substring(0, 500)}`);
+
+      // 5xx 重试同样需要保活，避免客户端等待期间超时断开
+      ensureSseKeepAlive(item);
+
+      if (retryCount + 1 > CONFIG.MAX_RETRY) {
+        log('WARN', `[#${reqId}] ⛔ 超过重试上限，透传 5xx 给客户端`);
+        const errBodyBytes = Buffer.byteLength(errBody, 'utf-8');
+        if (item.responseStarted) {
+          // 已提前建立 SSE 连接，无法再改状态码，只能通过 SSE 告知错误
+          respondError(item, statusCode, {
+            error: { message: `上游服务端错误 ${statusCode}`, type: 'proxy_upstream_error' }
+          });
+        } else {
+          res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+          res.end(errBody);
+        }
+        log('INFO', `[#${reqId}] ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)}`);
+        return;
+      }
+
+      // 客户端已断开则停止重试
+      if (res.destroyed || res.writableEnded) {
+        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        return;
+      }
+
+      log('WARN', `[#${reqId}] 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      item.retryCount = retryCount + 1;
+      await processRequest(item);
+      return;
+    }
+
+    // === 正常响应（2xx 或 4xx 非 429）===
+    // 记录上游响应头（排除内容体相关的，便于排查）
+    const headerDebug = Object.keys(proxyRes.headers)
+      .filter(k => !['transfer-encoding', 'content-encoding', 'content-length'].includes(k))
+      .map(k => `${k}: ${proxyRes.headers[k]}`)
+      .join(', ');
+    let upstreamLog = `[#${reqId}] ⬅️ 上游响应: ${statusCode} (${upstreamTime}ms)`;
+    if (rateLimitInfo) upstreamLog += ` | ${rateLimitInfo}`;
+    // 记录关键响应头，方便调试编码等问题
+    if (proxyRes.headers['content-encoding']) upstreamLog += ` | content-encoding: ${proxyRes.headers['content-encoding']}`;
+    log('INFO', upstreamLog);
+
+    // 4xx 非 429：不重试，直接透传
+    if (statusCode >= 400 && statusCode < 500) {
+      const errBody = await readResponseBody(proxyRes);
+      log('WARN', `[#${reqId}] ⚠️ 上游返回 ${statusCode}: ${errBody.substring(0, 500)}`);
+      const errBodyBytes = Buffer.byteLength(errBody, 'utf-8');
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(errBody);
+      log('INFO', `[#${reqId}] ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)} | total: ${Date.now() - startTime}ms`);
+      return;
+    }
+
+    // === 正常 2xx 响应：转发给客户端 ===
+    // 如果已通过 keepalive 发过响应头，跳过 writeHead
+    if (!item.responseStarted) {
+      const responseHeaders = { ...proxyRes.headers };
+      res.writeHead(statusCode, responseHeaders);
+    } else {
+      log('INFO', `[#${reqId}] 📡 SSE 连接已建立，透传上游数据`);
+    }
+
+    if (isStream) {
+      // 流式响应
+      let streamBytes = 0;
+
+      proxyRes.on('error', (err) => {
+        // 如果客户端（res）已断开，说明是客户端超时/取消导致的连锁错误，不重复报错
+        if (res.destroyed) return;
+        log('ERROR', `[#${reqId}] ❌ 流式上游传输错误: ${err.message}`);
+        proxyRes.unpipe(res);
+        proxyRes.destroy();
+        if (!res.destroyed) res.destroy();
+      });
+
+      // 客户端断连：清理上游连接
+      // （断开本身由 server 层的 res close 统一记录日志，此处不重复打印）
+      res.on('error', () => { proxyRes.unpipe(res); proxyRes.destroy(); });
+      res.on('close', () => { proxyRes.unpipe(res); proxyRes.destroy(); });
+
+      // 追踪流式响应大小
+      proxyRes.on('data', (chunk) => { streamBytes += chunk.length; });
+
+      proxyRes.on('end', () => {
+        if (res.destroyed) return; // 客户端已断开，无需记录
+        const totalTime = Date.now() - startTime;
+        log('INFO', `[#${reqId}] 🏁 流式传输完成 | ` +
+          `size: ~${formatBytes(streamBytes)} | total: ${totalTime}ms` +
+          (model ? ` | model: ${model}` : ''));
+      });
+
+      proxyRes.pipe(res);
+    } else {
+      // 非流式
+      const chunks = [];
+
+      proxyRes.on('error', (err) => {
+        log('ERROR', `[#${reqId}] ❌ 非流式响应接收错误: ${err.message}`);
+        if (!res.destroyed) {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+          }
+          res.end(JSON.stringify({ error: { message: `Proxy: ${err.message}`, type: 'proxy_stream_error' } }));
+        }
+      });
+
+      proxyRes.on('data', chunk => chunks.push(chunk));
+
+      proxyRes.on('end', () => {
+        if (!res.destroyed) {
+          const responseData = Buffer.concat(chunks);
+          res.end(responseData);
+          const totalTime = Date.now() - startTime;
+          log('INFO', `[#${reqId}] ✅ 完成: ${statusCode} | ` +
+            `body: ${formatBytes(responseData.length)} | total: ${totalTime}ms` +
+            (model ? ` | model: ${model}` : ''));
+        }
+      });
+    }
+
+  } catch (err) {
+    const elapsed = Date.now() - startTime;
+    log('ERROR', `[#${reqId}] ❌ 请求失败 (${elapsed}ms): ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
+    // 网络错误也重试
+    if (retryCount + 1 <= CONFIG.MAX_RETRY) {
+      // 网络错误（如 ECONNRESET）重试耗时可能很长，提前建立 SSE 连接并心跳保活，
+      // 否则客户端会先一步超时断开
+      ensureSseKeepAlive(item);
+
+      // 客户端已断开则停止重试，避免无意义的"幽灵请求"
+      if (res.destroyed || res.writableEnded) {
+        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        return;
+      }
+
+      log('WARN', `[#${reqId}] 🔄 网络错误，${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      item.retryCount = retryCount + 1;
+      await processRequest(item);
+    } else {
+      // 重试次数用尽，按连接状态选择合适的错误返回方式
+      respondError(item, 502, {
+        error: { message: `Proxy: ${err.message}`, type: 'proxy_network_error' }
+      });
+    }
+  }
+}
+
+/**
+ * 队列处理器 —— 保证请求按顺序逐个处理
+ */
+async function queueProcessor() {
+  if (isProcessing) return;
+  isProcessing = true;
+
+  while (requestQueue.length > 0) {
+    const item = requestQueue.shift();
+    // 记录出队时间，用于精确计算「入队 → 出队」的真实排队时长
+    // （避免重试时把上一次请求的处理耗时误记为队列等待）
+    item.dequeuedAt = Date.now();
+    await processRequest(item);
+  }
+
+  isProcessing = false;
+}
+
+// ---- 创建 HTTP 服务器 ----
+const server = http.createServer((req, res) => {
+  // 只要有连接进来就立刻记一条日志（不等请求体收完）
+  // 目的：区分「请求根本未到达代理」与「到达后中途断开」，
+  //       这是排查 4054（模型请求失败）时最关键的依据
+  const peer = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
+  log('INFO', `🔌 新连接: ${req.method} ${req.url} | from ${peer} | ` +
+    `content-length: ${req.headers['content-length'] || 'chunked'}`);
+
+  // TraeCode 连接中断时主动释放资源
+  req.on('error', (err) => {
+    log('ERROR', `❌ 客户端请求异常: ${err.message}`);
+  });
+
+  // 请求体还没收完就被中断（例如 TraeCode 主动取消、本机网络抖动）
+  // 这类情况以前完全不留痕，是排查的盲区
+  req.on('aborted', () => {
+    log('WARN', `⚠️ 请求体传输被中断: ${req.method} ${req.url}`);
+  });
+  req.on('close', () => {
+    if (!req.complete) {
+      log('WARN', `⚠️ 连接已关闭但请求体未接收完整: ${req.method} ${req.url}`);
+    }
+  });
+
+  // 响应未正常写完就关闭连接（客户端超时/取消），在此统一记录一次，
+  // 便于把 TraeCode 报的 4054 与具体请求对上
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      const tag = res.proxyReqId ? `[#${res.proxyReqId}] ` : '';
+      log('INFO', `${tag}⛔ 客户端提前断开，响应未写完: ${req.method} ${req.url}`);
+    }
+  });
+
+  // 不设路径过滤，所有请求透传给上游，由上游决定是否 404
+  // （TraeCode 发来的请求路径可能是 /v1/chat/completions、/chat/completions 等不同格式）
+
+  // 收集请求体
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf-8');
+    const model = extractModel(body);
+    const reqId = ++requestCounter;
+    // 把请求编号挂到响应对象上，便于连接级日志（如客户端提前断开）带上编号
+    res.proxyReqId = reqId;
+    const isStream = (body && body.includes('"stream":true')) || req.headers['accept'] === 'text/event-stream';
+    const bodyBytes = Buffer.byteLength(body || '', 'utf-8');
+    const msgStats = extractMessageStats(body);
+
+    // 统一在请求入队时记一条详细日志（后续所有日志都带 reqId）
+    let reqLog = `↗️ [#${reqId}] ${req.method} ${req.url}` +
+      (model ? ` | model: ${model}` : '') +
+      ` | body: ${formatBytes(bodyBytes)}` +
+      (isStream ? ' | stream' : '');
+    if (msgStats.count > 0) {
+      reqLog += ` | messages: ${msgStats.count}条 | prompt: ${formatBytes(msgStats.chars)}`;
+    }
+    log('INFO', reqLog);
+
+    // 加入队列
+    requestQueue.push({
+      reqId,
+      req,
+      res,
+      body,
+      model,
+      isStream,
+      enqueuedAt: Date.now(),
+      retryCount: 0,
+      responseStarted: false, // 是否已提前返回 SSE 响应头（限流时保持连接用）
+    });
+    // 触发队列处理
+    queueProcessor();
+  });
+});
+
+// ---- 启动服务器 ----
+server.listen(CONFIG.PROXY_PORT, () => {
+  // 清理过期日志 + 打开当天日志流
+  cleanOldLogs();
+  ensureLogStream();
+
+  log('INFO', '=============================================');
+  log('INFO', '  AI API 额度限流代理已启动');
+  log('INFO', `  监听地址: http://localhost:${CONFIG.PROXY_PORT}`);
+  log('INFO', `  目标 API: ${CONFIG.TARGET_URL}`);
+  log('INFO', `  429重试: 等待 ${CONFIG.RETRY_AFTER_SECONDS}s，最多 ${CONFIG.MAX_RETRY} 次`);
+  if (LOG_DIR) {
+    const keepDesc = CONFIG.LOG_KEEP_DAYS > 0
+      ? `保留 ${CONFIG.LOG_KEEP_DAYS} 天`
+      : '永久保留';
+    log('INFO', `  日志目录: ${LOG_DIR}（按日分文件，${keepDesc}）`);
+  }
+  log('INFO', '=============================================');
+  log('INFO', '');
+  log('INFO', '  TraeCode 自定义模型配置提示:');
+  log('INFO', `  API 地址   → http://localhost:${CONFIG.PROXY_PORT}`);
+  log('INFO', '  API Key 和 模型 ID 在 TraeCode 侧配置，代理直接透传');
+  log('INFO', '');
+  log('INFO', '  按 Ctrl+C 停止服务器');
+  log('INFO', '');
+
+  // 服务存活心跳：每隔一段时间在日志里打一条，
+  // 若某天日志中缺少心跳记录，即可判断进程已退出（例如编辑器关闭带走了终端）
+  setInterval(() => {
+    log('INFO', `💚 服务存活 | 队列中: ${requestQueue.length} | 累计请求: ${requestCounter}`);
+  }, CONFIG.HEARTBEAT_LOG_SECONDS * 1000).unref();
+});
+
+// ---- 服务器级错误监听（如端口被占用），避免静默失败 ----
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    // 端口被占用通常是重复启动，只记一行，避免堆栈刷屏
+    log('FATAL', `💥 端口 ${CONFIG.PROXY_PORT} 已被占用，可能已有另一个代理实例在运行，本进程退出`);
+  } else {
+    log('FATAL', `💥 服务器启动/运行错误: ${err.message}（端口 ${CONFIG.PROXY_PORT}）| stack: ${err.stack}`);
+  }
+  // 监听失败时进程无法提供服务，明确退出，交给守护脚本决定是否重启
+  process.exit(1);
+});
+
+// ---- 进程退出时留下明确日志，便于判断服务为何消失 ----
+['SIGINT', 'SIGTERM', 'SIGHUP'].forEach((signal) => {
+  process.on(signal, () => {
+    log('WARN', `🛑 收到退出信号 ${signal}，服务即将停止`);
+    process.exit(0);
+  });
+});
