@@ -151,9 +151,11 @@ process.on('uncaughtException', (err, origin) => {
 });
 // ====================================================
 
-// ---- 请求队列 ----
-const requestQueue = [];
-let isProcessing = false;
+// ---- 并发处理（不使用串行队列） ----
+// 串行队列会被慢请求阻塞：大上下文请求上游可能耗时 1~2 分钟，
+// 期间后续请求全部排队，客户端等不到响应就自行断开（TraeCode 报 4054）。
+// 现在每个请求独立并发处理，互不阻塞。
+let activeRequests = 0; // 当前正在处理的请求数
 let requestCounter = 0; // 自增请求ID，方便关联同一次请求的所有日志
 
 /** 从请求体中提取模型名（可能没有） */
@@ -385,11 +387,16 @@ async function processRequest(item) {
   const { reqId, req, res, body, model, isStream, enqueuedAt, retryCount } = item;
   const startTime = Date.now();
 
-  // 记录队列等待时间：仅取「入队 → 出队」这段真实排队时长，
-  // 重试时不重复计算（否则会把上一次请求的处理耗时误当排队时间）
-  const waitTime = (retryCount === 0 && enqueuedAt && item.dequeuedAt)
-    ? item.dequeuedAt - enqueuedAt
-    : 0;
+  // 并发模式下请求接收完成即开始处理，这里仅记录极短的调度间隔
+  // （重试时不重复计算，避免把上一次请求的处理耗时误当等待时间）
+  const waitTime = (retryCount === 0 && enqueuedAt) ? startTime - enqueuedAt : 0;
+
+  // 开始处理前检查客户端是否已断开（例如请求体刚发完就取消），
+  // 已断开则直接跳过，避免做无意义的转发、白白消耗上游额度
+  if (retryCount === 0 && (res.destroyed || res.writableEnded)) {
+    log('WARN', `[#${reqId}] ⛔ 客户端已断开，跳过本次请求`);
+    return;
+  }
 
   // 如果已经在重试中，先等待
   if (retryCount > 0) {
@@ -411,9 +418,9 @@ async function processRequest(item) {
   const headers = req.headers;
 
   try {
-    // 日志：队列等待 + 开始转发
+    // 日志：处理延迟 + 开始转发
     if (waitTime > 0) {
-      log('INFO', `[#${reqId}] 📋 队列等待: ${waitTime}ms`);
+      log('INFO', `[#${reqId}] 📋 处理延迟: ${waitTime}ms`);
     }
     log('INFO', `[#${reqId}] ➡️ 转发 → ${targetUrl}`);
 
@@ -614,24 +621,6 @@ async function processRequest(item) {
   }
 }
 
-/**
- * 队列处理器 —— 保证请求按顺序逐个处理
- */
-async function queueProcessor() {
-  if (isProcessing) return;
-  isProcessing = true;
-
-  while (requestQueue.length > 0) {
-    const item = requestQueue.shift();
-    // 记录出队时间，用于精确计算「入队 → 出队」的真实排队时长
-    // （避免重试时把上一次请求的处理耗时误记为队列等待）
-    item.dequeuedAt = Date.now();
-    await processRequest(item);
-  }
-
-  isProcessing = false;
-}
-
 // ---- 创建 HTTP 服务器 ----
 const server = http.createServer((req, res) => {
   // 只要有连接进来就立刻记一条日志（不等请求体收完）
@@ -682,18 +671,21 @@ const server = http.createServer((req, res) => {
     const bodyBytes = Buffer.byteLength(body || '', 'utf-8');
     const msgStats = extractMessageStats(body);
 
-    // 统一在请求入队时记一条详细日志（后续所有日志都带 reqId）
+    // 先计入并发数，日志里一并展示当前并发情况
+    activeRequests++;
+
+    // 统一在请求开始处理时记一条详细日志（后续所有日志都带 reqId）
     let reqLog = `↗️ [#${reqId}] ${req.method} ${req.url}` +
       (model ? ` | model: ${model}` : '') +
       ` | body: ${formatBytes(bodyBytes)}` +
-      (isStream ? ' | stream' : '');
+      (isStream ? ' | stream' : '') +
+      ` | 并发: ${activeRequests}`;
     if (msgStats.count > 0) {
       reqLog += ` | messages: ${msgStats.count}条 | prompt: ${formatBytes(msgStats.chars)}`;
     }
     log('INFO', reqLog);
 
-    // 加入队列
-    requestQueue.push({
+    const item = {
       reqId,
       req,
       res,
@@ -703,9 +695,16 @@ const server = http.createServer((req, res) => {
       enqueuedAt: Date.now(),
       retryCount: 0,
       responseStarted: false, // 是否已提前返回 SSE 响应头（限流时保持连接用）
-    });
-    // 触发队列处理
-    queueProcessor();
+    };
+
+    // 直接并发处理，不排队；捕获异常避免未处理的 Promise 拒绝影响其他请求
+    processRequest(item)
+      .catch((err) => {
+        log('ERROR', `[#${reqId}] 💥 请求处理异常: ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
+      })
+      .finally(() => {
+        activeRequests--;
+      });
   });
 });
 
@@ -738,7 +737,7 @@ server.listen(CONFIG.PROXY_PORT, () => {
   // 服务存活心跳：每隔一段时间在日志里打一条，
   // 若某天日志中缺少心跳记录，即可判断进程已退出（例如编辑器关闭带走了终端）
   setInterval(() => {
-    log('INFO', `💚 服务存活 | 队列中: ${requestQueue.length} | 累计请求: ${requestCounter}`);
+    log('INFO', `💚 服务存活 | 处理中: ${activeRequests} | 累计请求: ${requestCounter}`);
   }, CONFIG.HEARTBEAT_LOG_SECONDS * 1000).unref();
 });
 
