@@ -17,6 +17,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const crypto = require('crypto');
 
 // ===================== 配置区域 =====================
 const CONFIG = {
@@ -169,6 +170,106 @@ function extractModel(body) {
   }
 }
 
+// ---- 会话识别 ----
+// 同一对话的多轮请求只会在消息末尾追加内容，开头的 system 提示词与第一条 user 消息保持不变，
+// 因此用它们生成稳定指纹，就能把并行进行的多个对话区分开。
+const conversations = new Map(); // 会话ID -> 会话统计信息
+
+/** 把消息 content（可能是字符串或数组）转成纯文本 */
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => (part && (part.text || '')) || '').join(' ');
+  }
+  return '';
+}
+
+/** 从请求头中探测客户端可能携带的会话标识，取到即优先使用 */
+function extractSessionFromHeaders(headers) {
+  const candidates = [
+    'x-conversation-id', 'x-session-id', 'x-thread-id',
+    'x-chat-id', 'conversation-id', 'session-id',
+  ];
+  for (const key of candidates) {
+    const value = headers[key];
+    if (value) return String(value).slice(0, 12);
+  }
+  return '';
+}
+
+/**
+ * 计算对话指纹：system 提示词 + 第一条 user 消息的 MD5 前 6 位
+ * @param {string} body - 请求体 JSON 字符串
+ * @returns {string} 会话标识，无法识别时返回 'unknown'
+ */
+function computeConversationId(body) {
+  try {
+    const parsed = JSON.parse(body);
+    const messages = parsed.messages || [];
+    const systemMsg = messages.find(m => m.role === 'system');
+    const firstUserMsg = messages.find(m => m.role === 'user');
+    const systemText = systemMsg ? contentToText(systemMsg.content) : '';
+    const userText = firstUserMsg ? contentToText(firstUserMsg.content) : '';
+    // 各截取前 2000 字符：开头足以区分不同对话，同时避免超大文本的哈希开销
+    const seed = systemText.slice(0, 2000) + '\n---\n' + userText.slice(0, 2000);
+    if (!systemText && !userText) return 'unknown';
+    return crypto.createHash('md5').update(seed).digest('hex').slice(0, 6);
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * 登记会话并返回会话记录
+ * 首次出现时记录开场摘要与 system 提示词片段，方便人工识别是哪个对话
+ * @param {string} convId - 会话标识
+ * @param {string} body - 请求体 JSON 字符串
+ * @returns {object} 会话记录
+ */
+function registerConversation(convId, body) {
+  const now = Date.now();
+  const existing = conversations.get(convId);
+  if (existing) {
+    existing.requests++;
+    existing.lastSeen = now;
+    return existing;
+  }
+
+  let opening = '';
+  let systemPreview = '';
+  try {
+    const parsed = JSON.parse(body);
+    const messages = parsed.messages || [];
+    const systemMsg = messages.find(m => m.role === 'system');
+    const firstUserMsg = messages.find(m => m.role === 'user');
+    systemPreview = systemMsg ? contentToText(systemMsg.content).replace(/\s+/g, ' ').slice(0, 40) : '';
+    opening = firstUserMsg ? contentToText(firstUserMsg.content).replace(/\s+/g, ' ').slice(0, 60) : '';
+  } catch {
+    // 解析失败时摘要留空，不影响主流程
+  }
+
+  const conv = {
+    id: convId,
+    isNew: true,
+    requests: 1,
+    errors: 0,
+    opening,
+    systemPreview,
+    createdAt: now,
+    lastSeen: now,
+  };
+  conversations.set(convId, conv);
+  return conv;
+}
+
+/** 清理长时间未活跃的会话记录，避免 Map 无限增长（默认 24 小时） */
+function cleanupConversations(maxIdleMs = 24 * 60 * 60 * 1000) {
+  const expireBefore = Date.now() - maxIdleMs;
+  for (const [id, conv] of conversations) {
+    if (conv.lastSeen < expireBefore) conversations.delete(id);
+  }
+}
+
 /** 人类可读的字节大小 */
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
@@ -176,25 +277,43 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/** 提取请求中的消息统计 */
+/**
+ * 提取请求中的消息统计
+ * - textBytes: 纯文本内容的 UTF-8 字节数（真正的对话上下文）
+ * - nonTextBytes: 图片等非文本内容（如 base64）的字节数
+ * - toolBytes: 工具调用/工具结果的字节数
+ * 三者结合可定位「请求体很大但 prompt 很小」的原因
+ */
 function extractMessageStats(body) {
-  if (!body) return { count: 0, chars: 0 };
+  if (!body) return { count: 0, textBytes: 0, nonTextBytes: 0, toolBytes: 0 };
   try {
     const parsed = JSON.parse(body);
     const messages = parsed.messages || [];
-    let totalChars = 0;
+    let textBytes = 0;
+    let nonTextBytes = 0;
+    let toolBytes = 0;
+
     messages.forEach(msg => {
       if (typeof msg.content === 'string') {
-        totalChars += msg.content.length;
+        textBytes += Buffer.byteLength(msg.content, 'utf-8');
       } else if (Array.isArray(msg.content)) {
-        msg.content.forEach(c => {
-          if (c.text) totalChars += c.text.length;
+        msg.content.forEach(part => {
+          if (part && part.text) {
+            textBytes += Buffer.byteLength(part.text, 'utf-8');
+          } else {
+            // 图片等非文本片段，按序列化后的字节数统计
+            nonTextBytes += Buffer.byteLength(JSON.stringify(part), 'utf-8');
+          }
         });
       }
+      if (msg.tool_calls) {
+        toolBytes += Buffer.byteLength(JSON.stringify(msg.tool_calls), 'utf-8');
+      }
     });
-    return { count: messages.length, chars: totalChars };
+
+    return { count: messages.length, textBytes, nonTextBytes, toolBytes };
   } catch {
-    return { count: 0, chars: 0 };
+    return { count: 0, textBytes: 0, nonTextBytes: 0, toolBytes: 0 };
   }
 }
 
@@ -245,7 +364,7 @@ function readResponseBody(proxyRes) {
  * @returns {boolean} 客户端连接是否仍然可用
  */
 function ensureSseKeepAlive(item) {
-  const { reqId, res, isStream } = item;
+  const { reqId, convId, res, isStream } = item;
 
   // 客户端已断开，无需保活
   if (res.destroyed || res.writableEnded) return false;
@@ -254,7 +373,7 @@ function ensureSseKeepAlive(item) {
   if (!isStream) return true;
 
   if (!item.responseStarted) {
-    log('INFO', `[#${reqId}] 📡 提前返回 SSE 响应头（重试中，保持连接）`);
+    log('INFO', `[#${reqId}][会话 ${convId}] 📡 提前返回 SSE 响应头（重试中，保持连接）`);
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -276,7 +395,10 @@ function ensureSseKeepAlive(item) {
  * @param {object} payload - 标准错误体，形如 { error: { message, type } }
  */
 function respondError(item, statusCode, payload) {
-  const { res } = item;
+  const { res, conv } = item;
+
+  // 累加会话错误次数，便于后续汇总时定位出问题的对话
+  if (conv) conv.errors++;
 
   if (item.responseStarted) {
     // 已经写出 SSE 响应头，只能通过 SSE 事件告知错误，不能再 writeHead
@@ -384,8 +506,11 @@ function forwardRequest(targetUrl, method, headers, body) {
  * 每次重试先等待 RETRY_AFTER_SECONDS 秒
  */
 async function processRequest(item) {
-  const { reqId, req, res, body, model, isStream, enqueuedAt, retryCount } = item;
+  const { reqId, convId, conv, req, res, body, model, isStream, enqueuedAt, retryCount } = item;
   const startTime = Date.now();
+
+  // 统一日志前缀：请求编号 + 会话标识，便于在并行对话中定位是哪个对话出的问题
+  const tag = `[#${reqId}][会话 ${convId}]`;
 
   // 并发模式下请求接收完成即开始处理，这里仅记录极短的调度间隔
   // （重试时不重复计算，避免把上一次请求的处理耗时误当等待时间）
@@ -394,7 +519,7 @@ async function processRequest(item) {
   // 开始处理前检查客户端是否已断开（例如请求体刚发完就取消），
   // 已断开则直接跳过，避免做无意义的转发、白白消耗上游额度
   if (retryCount === 0 && (res.destroyed || res.writableEnded)) {
-    log('WARN', `[#${reqId}] ⛔ 客户端已断开，跳过本次请求`);
+    log('WARN', `${tag} ⛔ 客户端已断开，跳过本次请求`);
     return;
   }
 
@@ -402,10 +527,10 @@ async function processRequest(item) {
   if (retryCount > 0) {
     // 客户端（TraeCode）已断开则直接终止，避免为空连接继续重试
     if (res.destroyed || res.writableEnded) {
-      log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+      log('WARN', `${tag} ⛔ 客户端已断开，取消重试`);
       return;
     }
-    log('WARN', `[#${reqId}] ⏳ 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount}次)`);
+    log('WARN', `${tag} ⏳ 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount}次)`);
     // 带注释心跳的等待，避免客户端长时间无数据而超时
     await sleepWithHeartbeat(CONFIG.RETRY_AFTER_SECONDS * 1000, item);
   }
@@ -420,9 +545,9 @@ async function processRequest(item) {
   try {
     // 日志：处理延迟 + 开始转发
     if (waitTime > 0) {
-      log('INFO', `[#${reqId}] 📋 处理延迟: ${waitTime}ms`);
+      log('INFO', `${tag} 📋 处理延迟: ${waitTime}ms`);
     }
-    log('INFO', `[#${reqId}] ➡️ 转发 → ${targetUrl}`);
+    log('INFO', `${tag} ➡️ 转发 → ${targetUrl}`);
 
     // 转发请求
     const proxyRes = await forwardRequest(targetUrl, req.method, headers, body);
@@ -436,7 +561,7 @@ async function processRequest(item) {
     if (statusCode === 429) {
       // 读取上游错误体
       const errBody = await readResponseBody(proxyRes);
-      log('WARN', `[#${reqId}] 🔄 限流429` +
+      log('WARN', `${tag} 🔄 限流429` +
         (rateLimitInfo ? ` | ${rateLimitInfo}` : '') +
         ` | 上游响应: ${errBody.substring(0, 500)}`);
 
@@ -446,7 +571,7 @@ async function processRequest(item) {
 
       // 检查重试次数
       if (retryCount + 1 > CONFIG.MAX_RETRY) {
-        log('ERROR', `[#${reqId}] ❌ 超过最大重试次数(${CONFIG.MAX_RETRY})，放弃`);
+        log('ERROR', `${tag} ❌ 超过最大重试次数(${CONFIG.MAX_RETRY})，放弃`);
         respondError(item, 429, {
           error: { message: '超过最大重试次数，上游 API 持续限流', type: 'proxy_rate_limit' }
         });
@@ -455,11 +580,11 @@ async function processRequest(item) {
 
       // 客户端已断开则停止重试，避免无意义的"幽灵请求"（白白消耗上游额度）
       if (res.destroyed || res.writableEnded) {
-        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        log('WARN', `${tag} ⛔ 客户端已断开，取消重试`);
         return;
       }
 
-      log('WARN', `[#${reqId}] 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      log('WARN', `${tag} 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
       item.retryCount = retryCount + 1;
       await processRequest(item);
       return;
@@ -469,7 +594,7 @@ async function processRequest(item) {
     if (statusCode >= 500 && statusCode < 600) {
       // 读取上游错误体
       const errBody = await readResponseBody(proxyRes);
-      log('WARN', `[#${reqId}] 🔄 服务端错误 ${statusCode}` +
+      log('WARN', `${tag} 🔄 服务端错误 ${statusCode}` +
         (rateLimitInfo ? ` | ${rateLimitInfo}` : '') +
         ` | 上游响应: ${errBody.substring(0, 500)}`);
 
@@ -477,7 +602,7 @@ async function processRequest(item) {
       ensureSseKeepAlive(item);
 
       if (retryCount + 1 > CONFIG.MAX_RETRY) {
-        log('WARN', `[#${reqId}] ⛔ 超过重试上限，透传 5xx 给客户端`);
+        log('WARN', `${tag} ⛔ 超过重试上限，透传 5xx 给客户端`);
         const errBodyBytes = Buffer.byteLength(errBody, 'utf-8');
         if (item.responseStarted) {
           // 已提前建立 SSE 连接，无法再改状态码，只能通过 SSE 告知错误
@@ -488,17 +613,17 @@ async function processRequest(item) {
           res.writeHead(statusCode, { 'Content-Type': 'application/json' });
           res.end(errBody);
         }
-        log('INFO', `[#${reqId}] ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)}`);
+        log('INFO', `${tag} ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)}`);
         return;
       }
 
       // 客户端已断开则停止重试
       if (res.destroyed || res.writableEnded) {
-        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        log('WARN', `${tag} ⛔ 客户端已断开，取消重试`);
         return;
       }
 
-      log('WARN', `[#${reqId}] 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      log('WARN', `${tag} 🔄 等待 ${CONFIG.RETRY_AFTER_SECONDS}s 后重试 (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
       item.retryCount = retryCount + 1;
       await processRequest(item);
       return;
@@ -510,7 +635,7 @@ async function processRequest(item) {
       .filter(k => !['transfer-encoding', 'content-encoding', 'content-length'].includes(k))
       .map(k => `${k}: ${proxyRes.headers[k]}`)
       .join(', ');
-    let upstreamLog = `[#${reqId}] ⬅️ 上游响应: ${statusCode} (${upstreamTime}ms)`;
+    let upstreamLog = `${tag} ⬅️ 上游响应: ${statusCode} (${upstreamTime}ms)`;
     if (rateLimitInfo) upstreamLog += ` | ${rateLimitInfo}`;
     // 记录关键响应头，方便调试编码等问题
     if (proxyRes.headers['content-encoding']) upstreamLog += ` | content-encoding: ${proxyRes.headers['content-encoding']}`;
@@ -519,11 +644,11 @@ async function processRequest(item) {
     // 4xx 非 429：不重试，直接透传
     if (statusCode >= 400 && statusCode < 500) {
       const errBody = await readResponseBody(proxyRes);
-      log('WARN', `[#${reqId}] ⚠️ 上游返回 ${statusCode}: ${errBody.substring(0, 500)}`);
+      log('WARN', `${tag} ⚠️ 上游返回 ${statusCode}: ${errBody.substring(0, 500)}`);
       const errBodyBytes = Buffer.byteLength(errBody, 'utf-8');
       res.writeHead(statusCode, { 'Content-Type': 'application/json' });
       res.end(errBody);
-      log('INFO', `[#${reqId}] ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)} | total: ${Date.now() - startTime}ms`);
+      log('INFO', `${tag} ✅ 透传 ${statusCode} | body: ${formatBytes(errBodyBytes)} | total: ${Date.now() - startTime}ms`);
       return;
     }
 
@@ -533,20 +658,61 @@ async function processRequest(item) {
       const responseHeaders = { ...proxyRes.headers };
       res.writeHead(statusCode, responseHeaders);
     } else {
-      log('INFO', `[#${reqId}] 📡 SSE 连接已建立，透传上游数据`);
+      log('INFO', `${tag} 📡 SSE 连接已建立，透传上游数据`);
     }
 
     if (isStream) {
       // 流式响应
       let streamBytes = 0;
 
+      // 采样响应开头 2KB：客户端异常断开时输出，便于确认上游到底返回了什么
+      const PREVIEW_LIMIT = 2048;
+      res.proxyPreviewChunks = [];
+      res.proxyPreviewEncoded = !!proxyRes.headers['content-encoding'];
+      let previewBytes = 0;
+
+      // 尾部采样：滚动保留最后 2KB，用于判断客户端断开前是否已收到结束标志
+      res.proxyTailChunks = [];
+      let tailBytes = 0;
+
       proxyRes.on('error', (err) => {
         // 如果客户端（res）已断开，说明是客户端超时/取消导致的连锁错误，不重复报错
         if (res.destroyed) return;
-        log('ERROR', `[#${reqId}] ❌ 流式上游传输错误: ${err.message}`);
+        log('ERROR', `${tag} ❌ 流式上游传输错误: ${err.message}`);
         proxyRes.unpipe(res);
         proxyRes.destroy();
-        if (!res.destroyed) res.destroy();
+
+        // 上游中途中断时必须给客户端一个明确的结束信号：
+        // 否则 SSE 客户端收不到 [DONE] 或错误事件，会一直停在「生成中」状态。
+        if (!res.writableEnded) {
+          try {
+            if (!res.headersSent) {
+              // 还没写出响应头，直接返回标准 JSON 错误
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                error: {
+                  message: `上游响应中断: ${err.message}`,
+                  type: 'proxy_stream_aborted',
+                }
+              }));
+              return;
+            }
+            // 已建立 SSE 连接：补发错误事件 + 结束标记
+            res.write(`data: ${JSON.stringify({
+              error: {
+                message: `上游响应中断(${err.message})，请重试`,
+                type: 'proxy_stream_aborted',
+              }
+            })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          } catch (writeErr) {
+            // 写入失败说明连接已不可用，销毁兜底
+            if (!res.destroyed) res.destroy();
+          }
+        } else if (!res.destroyed) {
+          res.destroy();
+        }
       });
 
       // 客户端断连：清理上游连接
@@ -554,13 +720,43 @@ async function processRequest(item) {
       res.on('error', () => { proxyRes.unpipe(res); proxyRes.destroy(); });
       res.on('close', () => { proxyRes.unpipe(res); proxyRes.destroy(); });
 
-      // 追踪流式响应大小
-      proxyRes.on('data', (chunk) => { streamBytes += chunk.length; });
+      // 追踪已发送字节数，并采样响应开头与结尾
+      proxyRes.on('data', (chunk) => {
+        streamBytes += chunk.length;
+        res.proxySentBytes = streamBytes;
+
+        // 头部采样（前 2KB）
+        if (previewBytes < PREVIEW_LIMIT) {
+          const take = Math.min(PREVIEW_LIMIT - previewBytes, chunk.length);
+          res.proxyPreviewChunks.push(Buffer.from(chunk.subarray(0, take)));
+          previewBytes += take;
+        }
+
+        // 尾部采样（滚动窗口，只保留最后 2KB）
+        res.proxyTailChunks.push(Buffer.from(chunk));
+        tailBytes += chunk.length;
+        while (tailBytes > PREVIEW_LIMIT && res.proxyTailChunks.length > 0) {
+          const first = res.proxyTailChunks[0];
+          if (tailBytes - first.length >= PREVIEW_LIMIT) {
+            res.proxyTailChunks.shift();
+            tailBytes -= first.length;
+          } else {
+            // 首块只需要裁掉超出的部分
+            const cut = tailBytes - PREVIEW_LIMIT;
+            res.proxyTailChunks[0] = first.subarray(cut);
+            tailBytes -= cut;
+            break;
+          }
+        }
+      });
 
       proxyRes.on('end', () => {
+        // 上游数据已完整接收：此后连接关闭属于正常收尾，
+        // 不能当成「客户端提前断开」（否则会误报，干扰 4054 排查）
+        res.proxyStreamDone = true;
         if (res.destroyed) return; // 客户端已断开，无需记录
         const totalTime = Date.now() - startTime;
-        log('INFO', `[#${reqId}] 🏁 流式传输完成 | ` +
+        log('INFO', `${tag} 🏁 流式传输完成 | ` +
           `size: ~${formatBytes(streamBytes)} | total: ${totalTime}ms` +
           (model ? ` | model: ${model}` : ''));
       });
@@ -571,7 +767,7 @@ async function processRequest(item) {
       const chunks = [];
 
       proxyRes.on('error', (err) => {
-        log('ERROR', `[#${reqId}] ❌ 非流式响应接收错误: ${err.message}`);
+        log('ERROR', `${tag} ❌ 非流式响应接收错误: ${err.message}`);
         if (!res.destroyed) {
           if (!res.headersSent) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -586,8 +782,11 @@ async function processRequest(item) {
         if (!res.destroyed) {
           const responseData = Buffer.concat(chunks);
           res.end(responseData);
+          // 响应已完整写出，标记完成，避免 close 时误判为提前断开
+          res.proxyStreamDone = true;
+          res.proxySentBytes = responseData.length;
           const totalTime = Date.now() - startTime;
-          log('INFO', `[#${reqId}] ✅ 完成: ${statusCode} | ` +
+          log('INFO', `${tag} ✅ 完成: ${statusCode} | ` +
             `body: ${formatBytes(responseData.length)} | total: ${totalTime}ms` +
             (model ? ` | model: ${model}` : ''));
         }
@@ -596,7 +795,7 @@ async function processRequest(item) {
 
   } catch (err) {
     const elapsed = Date.now() - startTime;
-    log('ERROR', `[#${reqId}] ❌ 请求失败 (${elapsed}ms): ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
+    log('ERROR', `${tag} ❌ 请求失败 (${elapsed}ms): ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
     // 网络错误也重试
     if (retryCount + 1 <= CONFIG.MAX_RETRY) {
       // 网络错误（如 ECONNRESET）重试耗时可能很长，提前建立 SSE 连接并心跳保活，
@@ -605,11 +804,11 @@ async function processRequest(item) {
 
       // 客户端已断开则停止重试，避免无意义的"幽灵请求"
       if (res.destroyed || res.writableEnded) {
-        log('WARN', `[#${reqId}] ⛔ 客户端已断开，取消重试`);
+        log('WARN', `${tag} ⛔ 客户端已断开，取消重试`);
         return;
       }
 
-      log('WARN', `[#${reqId}] 🔄 网络错误，${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
+      log('WARN', `${tag} 🔄 网络错误，${CONFIG.RETRY_AFTER_SECONDS}s 后重试... (第${retryCount + 1}/${CONFIG.MAX_RETRY}次)`);
       item.retryCount = retryCount + 1;
       await processRequest(item);
     } else {
@@ -649,10 +848,52 @@ const server = http.createServer((req, res) => {
   // 响应未正常写完就关闭连接（客户端超时/取消），在此统一记录一次，
   // 便于把 TraeCode 报的 4054 与具体请求对上
   res.on('close', () => {
-    if (!res.writableFinished) {
-      const tag = res.proxyReqId ? `[#${res.proxyReqId}] ` : '';
-      log('INFO', `${tag}⛔ 客户端提前断开，响应未写完: ${req.method} ${req.url}`);
+    // 仅当「响应未写完」且「上游数据也未完整接收」时才进入判定流程。
+    // 上游已传完（proxyStreamDone）后的连接关闭属于正常收尾，不能误报。
+    if (res.writableFinished || res.proxyStreamDone) return;
+
+    const tag = res.proxyReqId
+      ? `[#${res.proxyReqId}]${res.proxyConvId ? `[会话 ${res.proxyConvId}]` : ''} `
+      : '';
+    const sent = res.proxySentBytes || 0;
+
+    // 尾部采样：检查客户端断开前是否已经收到结束标志。
+    // 很多 SSE 客户端拿到 finish_reason / [DONE] 后就会主动关闭连接，
+    // 这属于正常读完，不应算作「提前断开」。
+    let tailText = '';
+    if (res.proxyTailChunks && res.proxyTailChunks.length > 0) {
+      tailText = Buffer.concat(res.proxyTailChunks).toString('utf-8');
     }
+    const clientFinished = /"finish_reason"\s*:\s*"(stop|tool_calls|length|content_filter)"|\[DONE\]/.test(tailText);
+
+    if (clientFinished) {
+      log('INFO', `${tag}🟢 客户端已读完回复后关闭连接（已发送 ${formatBytes(sent)}）`);
+      return;
+    }
+
+    // === 以下为真正的提前断开 ===
+    let detail = `已发送: ${formatBytes(sent)}`;
+
+    // 头部采样：查看上游实际返回的内容（压缩内容无法直接阅读，只标注大小）
+    if (res.proxyPreviewChunks && res.proxyPreviewChunks.length > 0) {
+      if (res.proxyPreviewEncoded) {
+        detail += ` | 响应为压缩内容(${formatBytes(Buffer.concat(res.proxyPreviewChunks).length)} 采样)`;
+      } else {
+        const head = Buffer.concat(res.proxyPreviewChunks)
+          .toString('utf-8')
+          .replace(/\s+/g, ' ')
+          .slice(0, 300);
+        if (head) detail += ` | 头部: ${head}`;
+      }
+    }
+
+    // 尾部采样：看中断发生在哪个事件之后（是否出现 error 等）
+    if (tailText) {
+      const tail = tailText.replace(/\s+/g, ' ').slice(-300);
+      if (tail) detail += ` | 尾部: ${tail}`;
+    }
+
+    log('INFO', `${tag}⛔ 客户端提前断开，响应未写完 | ${detail}`);
   });
 
   // 不设路径过滤，所有请求透传给上游，由上游决定是否 404
@@ -665,8 +906,14 @@ const server = http.createServer((req, res) => {
     const body = Buffer.concat(chunks).toString('utf-8');
     const model = extractModel(body);
     const reqId = ++requestCounter;
-    // 把请求编号挂到响应对象上，便于连接级日志（如客户端提前断开）带上编号
+    // 优先使用客户端请求头里的会话标识；没有则用「system + 首条 user 消息」生成对话指纹
+    const convId = extractSessionFromHeaders(req.headers) || computeConversationId(body);
+    const conv = registerConversation(convId, body);
+
+    // 把请求编号与会话标识挂到响应对象上，便于连接级日志（如客户端提前断开）也能带上
     res.proxyReqId = reqId;
+    res.proxyConvId = convId;
+
     const isStream = (body && body.includes('"stream":true')) || req.headers['accept'] === 'text/event-stream';
     const bodyBytes = Buffer.byteLength(body || '', 'utf-8');
     const msgStats = extractMessageStats(body);
@@ -674,19 +921,31 @@ const server = http.createServer((req, res) => {
     // 先计入并发数，日志里一并展示当前并发情况
     activeRequests++;
 
-    // 统一在请求开始处理时记一条详细日志（后续所有日志都带 reqId）
-    let reqLog = `↗️ [#${reqId}] ${req.method} ${req.url}` +
+    // 新会话首次出现时打印识别线索，方便人工对上是哪个对话
+    if (conv.isNew) {
+      log('INFO', `🆕 [会话 ${convId}] 新对话 | 开场: ${conv.opening || '(无)'}` +
+        (conv.systemPreview ? ` | system: ${conv.systemPreview}` : ''));
+      conv.isNew = false;
+    }
+
+    // 统一在请求开始处理时记一条详细日志（后续所有日志都带 reqId 与会话标识）
+    let reqLog = `↗️ [#${reqId}][会话 ${convId}] ${req.method} ${req.url}` +
       (model ? ` | model: ${model}` : '') +
       ` | body: ${formatBytes(bodyBytes)}` +
       (isStream ? ' | stream' : '') +
       ` | 并发: ${activeRequests}`;
     if (msgStats.count > 0) {
-      reqLog += ` | messages: ${msgStats.count}条 | prompt: ${formatBytes(msgStats.chars)}`;
+      reqLog += ` | messages: ${msgStats.count}条 | prompt: ${formatBytes(msgStats.textBytes)}`;
+      // 请求体远大于 prompt 时，这两个数值能说明多出来的体积来自哪里
+      if (msgStats.nonTextBytes > 0) reqLog += ` | 非文本: ${formatBytes(msgStats.nonTextBytes)}`;
+      if (msgStats.toolBytes > 0) reqLog += ` | 工具: ${formatBytes(msgStats.toolBytes)}`;
     }
     log('INFO', reqLog);
 
     const item = {
       reqId,
+      convId,
+      conv,
       req,
       res,
       body,
@@ -700,7 +959,7 @@ const server = http.createServer((req, res) => {
     // 直接并发处理，不排队；捕获异常避免未处理的 Promise 拒绝影响其他请求
     processRequest(item)
       .catch((err) => {
-        log('ERROR', `[#${reqId}] 💥 请求处理异常: ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
+        log('ERROR', `[#${reqId}][会话 ${convId}] 💥 请求处理异常: ${err.message} | stack: ${err.stack?.substring(0, 300)}`);
       })
       .finally(() => {
         activeRequests--;
@@ -737,7 +996,9 @@ server.listen(CONFIG.PROXY_PORT, () => {
   // 服务存活心跳：每隔一段时间在日志里打一条，
   // 若某天日志中缺少心跳记录，即可判断进程已退出（例如编辑器关闭带走了终端）
   setInterval(() => {
-    log('INFO', `💚 服务存活 | 处理中: ${activeRequests} | 累计请求: ${requestCounter}`);
+    // 顺带清理 24 小时未活跃的会话记录，避免内存持续增长
+    cleanupConversations();
+    log('INFO', `💚 服务存活 | 处理中: ${activeRequests} | 活跃会话: ${conversations.size} | 累计请求: ${requestCounter}`);
   }, CONFIG.HEARTBEAT_LOG_SECONDS * 1000).unref();
 });
 
